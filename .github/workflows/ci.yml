@@ -2,9 +2,9 @@ name: Quality assurance
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
   linting:
@@ -12,10 +12,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # django-upgrade is pinned to python3.12. setup-python leaves each
+      # interpreter on PATH, and the later step is the default for pre-commit.
       - name: Set up Python 3.12
         uses: actions/setup-python@v4
         with:
           python-version: "3.12"
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.14"
 
       - name: Install required packages
         run: pip install pre-commit
@@ -25,26 +32,77 @@ jobs:
 
   build:
     name: Python ${{ matrix.python-version }}, django ${{ matrix.django-version }}
-    runs-on: ubuntu-latest
+    # setup-python publishes no 3.8 or 3.9 builds for Ubuntu 26.04 (ubuntu-latest).
+    runs-on: ${{ (matrix.python-version == '3.8' || matrix.python-version == '3.9') && 'ubuntu-24.04' || 'ubuntu-latest' }}
+
+    services:
+      localstack:
+        # Pin a release image so CI does not break when :latest changes. The image
+        # ships its own HTTP healthcheck; avoid awslocal-based checks — newer
+        # LocalStack can lazy-load SES so SES CLI probes fail during startup.
+        image: localstack/localstack:3.8
+        env:
+          SERVICES: ses
+          DEBUG: 1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        ports:
+          - 4566:4566
+
     strategy:
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
-        django-version: [32, 42, 50]
+        python-version: ["3.14", "3.13", "3.12", "3.11", "3.10", "3.9", "3.8"]
+        # 61 first: default / newest tested combo where Python allows (Django 6 needs 3.12+).
+        django-version: [61, 60, 52, 42, 32]
         exclude:
-          - python-version: '3.8'
-            django-version: 50
-          - python-version: '3.9'
-            django-version: 50
+          - python-version: "3.13"
+            django-version: 32
+          - python-version: "3.14"
+            django-version: 32
+          - python-version: "3.8"
+            django-version: 52
+          - python-version: "3.9"
+            django-version: 52
+          - python-version: "3.8"
+            django-version: 60
+          - python-version: "3.9"
+            django-version: 60
+          - python-version: "3.10"
+            django-version: 60
+          - python-version: "3.11"
+            django-version: 60
+          - python-version: "3.8"
+            django-version: 61
+          - python-version: "3.9"
+            django-version: 61
+          - python-version: "3.10"
+            django-version: 61
+          - python-version: "3.11"
+            django-version: 61
 
     steps:
       - uses: actions/checkout@v4
-      - name: setup python
+      - name: Initialize LocalStack SES
+        run: |
+          # Wait for LocalStack to be fully ready
+          for i in {1..30}; do
+            if docker exec ${{ job.services.localstack.id }} awslocal ses list-identities --region eu-central-1; then
+              break
+            fi
+            echo "Waiting for LocalStack... ($i/30)"
+            sleep 2
+          done
+
+          # Run initialization commands
+          docker exec ${{ job.services.localstack.id }} awslocal ses verify-domain-identity --domain "example.com" --region "eu-central-1"
+      - name: Setup python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install tox
         run: pip install tox
-      - name: Run Tests
+      - name: Run tests
         env:
           TOXENV: django${{ matrix.django-version }}
+          LOCALSTACK_ENDPOINT: http://localstack:4566
         run: tox

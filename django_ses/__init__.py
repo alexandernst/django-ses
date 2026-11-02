@@ -1,16 +1,23 @@
 import importlib.metadata as importlib_metadata
 import logging
+import re
 from datetime import datetime, timedelta
+from email import policy
 from time import sleep
 
 import boto3
+import botocore
+import django
+from botocore.exceptions import ClientError
 from botocore.vendored.requests.packages.urllib3.exceptions import ResponseError
+from django.core.mail import EmailMessage
 from django.core.mail.backends.base import BaseEmailBackend
 
-from django_ses import settings
+from django_ses import signals
+from django_ses.conf import settings
 
 __version__ = importlib_metadata.version(__name__)
-__all__ = ('SESBackend',)
+__all__ = ("SESBackend",)
 
 # These would be nice to make class-level variables, but the backend is
 # re-created for each outgoing email/batch.
@@ -20,7 +27,25 @@ __all__ = ('SESBackend',)
 cached_rate_limits = {}
 recent_send_times = []
 
-logger = logging.getLogger('django_ses')
+logger = logging.getLogger("django_ses")
+
+# SES v2 SendEmail accepts TenantName starting with botocore 1.40.0 (Python 3.9+).
+TENANT_MIN_BOTOCORE_VERSION = (1, 40, 0)
+
+
+def _botocore_version():
+    """Return the installed botocore version as a tuple of ints, e.g. (1, 40, 0)."""
+    parts = []
+    for part in botocore.__version__.split("."):
+        digits = re.match(r"\d+", part)
+        if not digits:
+            break
+        parts.append(int(digits.group()))
+    return tuple(parts)
+
+
+def botocore_supports_tenants():
+    return _botocore_version() >= TENANT_MIN_BOTOCORE_VERSION
 
 
 def dkim_sign(message, dkim_domain=None, dkim_key=None, dkim_selector=None, dkim_headers=None):
@@ -31,11 +56,7 @@ def dkim_sign(message, dkim_domain=None, dkim_key=None, dkim_selector=None, dkim
         pass
     else:
         if dkim_domain and dkim_key:
-            sig = dkim.sign(message,
-                            dkim_selector,
-                            dkim_domain,
-                            dkim_key,
-                            include_headers=dkim_headers)
+            sig = dkim.sign(message, dkim_selector, dkim_domain, dkim_key, include_headers=dkim_headers)
             message = sig + message
     return message
 
@@ -47,20 +68,73 @@ def cast_nonzero_to_float(val):
     return float(val)
 
 
-class SESBackend(BaseEmailBackend):
-    """A Django Email backend that uses Amazon's Simple Email Service.
-    """
+if django.VERSION >= (6, 0):
 
-    def __init__(self, fail_silently=False,aws_session_profile=None, aws_access_key=None,
-                 aws_secret_key=None, aws_session_token=None, aws_region_name=None,
-                 aws_region_endpoint=None, aws_auto_throttle=None, aws_config=None,
-                 dkim_domain=None, dkim_key=None, dkim_selector=None, dkim_headers=None,
-                 ses_source_arn=None, ses_from_arn=None, ses_return_path_arn=None,
-                 use_ses_v2=False,
-        **kwargs
+    def get_message_bytes(message: EmailMessage) -> bytes:
+        """
+        Serialize email message to bytes with proper line endings.
+
+        Django 6.0+ requires policy.SMTP for RFC-compliant CRLF line endings.
+        Earlier versions use the linesep parameter for the same purpose.
+
+        Args:
+            message: Django EmailMessage instance
+
+        Returns:
+            bytes: Serialized email message with appropriate line endings
+        """
+        return message.message().as_bytes(policy=policy.SMTP)
+else:
+
+    def get_message_bytes(message: EmailMessage) -> bytes:
+        """
+        Serialize email message to bytes with proper line endings.
+
+        Django 6.0+ requires policy.SMTP for RFC-compliant CRLF line endings.
+        Earlier versions use the linesep parameter for the same purpose.
+
+        Args:
+            message: Django EmailMessage instance
+
+        Returns:
+            bytes: Serialized email message with appropriate line endings
+        """
+        return message.message().as_bytes(linesep="\r\n")
+
+
+class SESBackend(BaseEmailBackend):
+    """A Django Email backend that uses Amazon's Simple Email Service."""
+
+    def __init__(
+        self,
+        fail_silently=False,
+        aws_session_profile=None,
+        aws_access_key=None,
+        aws_secret_key=None,
+        aws_session_token=None,
+        aws_region_name=None,
+        aws_region_endpoint=None,
+        aws_auto_throttle=None,
+        aws_config=None,
+        dkim_domain=None,
+        dkim_key=None,
+        dkim_selector=None,
+        dkim_headers=None,
+        ses_source_arn=None,
+        ses_from_arn=None,
+        ses_return_path_arn=None,
+        use_ses_v2=False,
+        aws_global_endpoint_id=None,
+        **kwargs,
     ):
 
-        super(SESBackend, self).__init__(fail_silently=fail_silently, **kwargs)
+        # Django 6.1+ removed ``fail_silently`` from ``BaseEmailBackend.__init__()``;
+        # a subclass that supports it must set the attribute itself. Forwarding it to
+        # ``super()`` raises ``InvalidMailer`` when instantiated from a ``MAILERS``
+        # alias, and warns ``RemovedInDjango70Warning`` otherwise. Setting it directly
+        # works on every supported Django version.
+        super(SESBackend, self).__init__(**kwargs)
+        self.fail_silently = fail_silently
         self._session_profile = aws_session_profile or settings.AWS_SESSION_PROFILE
         self._access_key_id = aws_access_key or settings.ACCESS_KEY
         self._access_key = aws_secret_key or settings.SECRET_KEY
@@ -80,6 +154,23 @@ class SESBackend(BaseEmailBackend):
         self.ses_return_path_arn = ses_return_path_arn or settings.AWS_SES_RETURN_PATH_ARN
 
         self._use_ses_v2 = use_ses_v2 or settings.USE_SES_V2
+
+        self._global_endpoint_id = aws_global_endpoint_id or settings.AWS_SES_GLOBAL_ENDPOINT_ID
+
+        # Validate that global endpoint ID requires SES v2
+        if self._global_endpoint_id and not self._use_ses_v2:
+            raise ValueError(
+                "AWS_SES_GLOBAL_ENDPOINT_ID requires USE_SES_V2=True. "
+                "Global endpoints (Multi-Region Endpoints) are only supported by SES API v2."
+            )
+        if settings.AWS_SES_TENANT and not self._use_ses_v2:
+            raise ValueError("AWS_SES_TENANT requires USE_SES_V2=True. Tenant sending is only supported by SES API v2.")
+        if settings.AWS_SES_TENANT and not botocore_supports_tenants():
+            raise ValueError(
+                "AWS_SES_TENANT requires boto3 and botocore 1.40.0 or newer (Python 3.9+); found botocore {}.".format(
+                    botocore.__version__
+                )
+            )
 
         self.connection = None
 
@@ -113,8 +204,7 @@ class SESBackend(BaseEmailBackend):
                 raise
 
     def close(self):
-        """Close any open HTTP connections to the API server.
-        """
+        """Close any open HTTP connections to the API server."""
         self.connection = None
 
     def send_messages(self, email_messages):
@@ -135,12 +225,13 @@ class SESBackend(BaseEmailBackend):
         for message in email_messages:
             if settings.AWS_SES_USE_BLACKLIST:
                 from django_ses import utils
+
                 message.to = utils.filter_blacklisted_recipients(message.to)
                 message.cc = utils.filter_blacklisted_recipients(message.cc)
                 message.bcc = utils.filter_blacklisted_recipients(message.bcc)
 
                 if len(message.to) + len(message.cc) + len(message.bcc) == 0:
-                    logger.debug('Refusing to send email. All recipients were filtered by the blacklist')
+                    logger.debug("Refusing to send email. All recipients were filtered by the blacklist")
                     continue
 
             # SES Configuration sets. If the AWS_SES_CONFIGURATION_SET setting
@@ -150,20 +241,37 @@ class SESBackend(BaseEmailBackend):
             # If settings.AWS_SES_CONFIGURATION_SET is a callable, pass it the
             # message object and dkim settings and expect it to return a string
             # containing the SES Configuration Set name.
-            if (settings.AWS_SES_CONFIGURATION_SET
-                    and 'X-SES-CONFIGURATION-SET' not in message.extra_headers):
+            if settings.AWS_SES_CONFIGURATION_SET and "X-SES-CONFIGURATION-SET" not in message.extra_headers:
                 if callable(settings.AWS_SES_CONFIGURATION_SET):
-                    message.extra_headers[
-                        'X-SES-CONFIGURATION-SET'] = settings.AWS_SES_CONFIGURATION_SET(
-                            message,
-                            dkim_domain=self.dkim_domain,
-                            dkim_key=self.dkim_key,
-                            dkim_selector=self.dkim_selector,
-                            dkim_headers=self.dkim_headers
-                        )
+                    message.extra_headers["X-SES-CONFIGURATION-SET"] = settings.AWS_SES_CONFIGURATION_SET(
+                        message,
+                        dkim_domain=self.dkim_domain,
+                        dkim_key=self.dkim_key,
+                        dkim_selector=self.dkim_selector,
+                        dkim_headers=self.dkim_headers,
+                    )
                 else:
-                    message.extra_headers[
-                        'X-SES-CONFIGURATION-SET'] = settings.AWS_SES_CONFIGURATION_SET
+                    message.extra_headers["X-SES-CONFIGURATION-SET"] = settings.AWS_SES_CONFIGURATION_SET
+
+            # SES tenants. An X-SES-TENANT header on the message overrides
+            # settings.AWS_SES_TENANT, which may be a callable returning the
+            # tenant name (None or "" sends without a tenant). A header-only
+            # tenant is passed as TenantName only when the SES v2 client
+            # supports it; otherwise the header is left in the raw message.
+            tenant_name = None
+            if "X-SES-TENANT" in message.extra_headers:
+                if self._use_ses_v2 and botocore_supports_tenants():
+                    tenant_name = message.extra_headers["X-SES-TENANT"]
+            elif callable(settings.AWS_SES_TENANT):
+                tenant_name = settings.AWS_SES_TENANT(
+                    message,
+                    dkim_domain=self.dkim_domain,
+                    dkim_key=self.dkim_key,
+                    dkim_selector=self.dkim_selector,
+                    dkim_headers=self.dkim_headers,
+                )
+            else:
+                tenant_name = settings.AWS_SES_TENANT
 
             # Automatic throttling. Assumes that this is the only SES client
             # currently operating. The AWS_SES_AUTO_THROTTLE setting is a
@@ -173,38 +281,44 @@ class SESBackend(BaseEmailBackend):
             if self._throttle:
                 self._update_throttling()
 
-            kwargs = self._get_send_email_parameters(message, source, email_feedback)
+            kwargs = self._get_send_email_parameters(message, source, email_feedback, tenant_name)
 
             try:
-                response = (self.connection.send_email(**kwargs)
-                            if self._use_ses_v2
-                            else self.connection.send_raw_email(**kwargs))
-                message.extra_headers['status'] = 200
-                message.extra_headers['message_id'] = response['MessageId']
-                message.extra_headers['request_id'] = response['ResponseMetadata']['RequestId']
+                response = (
+                    self.connection.send_email(**kwargs)
+                    if self._use_ses_v2
+                    else self.connection.send_raw_email(**kwargs)
+                )
+                message.extra_headers["status"] = 200
+                message.extra_headers["message_id"] = response["MessageId"]
+                message.extra_headers["request_id"] = response["ResponseMetadata"]["RequestId"]
                 num_sent += 1
-                if 'X-SES-CONFIGURATION-SET' in message.extra_headers:
+                if "X-SES-CONFIGURATION-SET" in message.extra_headers:
                     logger.debug(
                         "send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}' "
                         "ses-configuration-set='{}'".format(
                             message.from_email,
                             ", ".join(message.recipients()),
-                            message.extra_headers['message_id'],
-                            message.extra_headers['request_id'],
-                            message.extra_headers['X-SES-CONFIGURATION-SET']
-                        ))
+                            message.extra_headers["message_id"],
+                            message.extra_headers["request_id"],
+                            message.extra_headers["X-SES-CONFIGURATION-SET"],
+                        )
+                    )
                 else:
-                    logger.debug("send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}'".format(
-                        message.from_email,
-                        ", ".join(message.recipients()),
-                        message.extra_headers['message_id'],
-                        message.extra_headers['request_id']
-                    ))
+                    logger.debug(
+                        "send_messages.sent from='{}' recipients='{}' message_id='{}' request_id='{}'".format(
+                            message.from_email,
+                            ", ".join(message.recipients()),
+                            message.extra_headers["message_id"],
+                            message.extra_headers["request_id"],
+                        )
+                    )
 
-            except ResponseError as err:
+                signals.message_sent.send(sender=SESBackend, message=message)
+
+            except (ResponseError, ClientError) as err:
                 # Store failure information so to post process it if required
-                error_keys = ['status', 'reason', 'body', 'request_id',
-                              'error_code', 'error_message']
+                error_keys = ["status", "reason", "body", "request_id", "error_code", "error_message"]
                 for key in error_keys:
                     message.extra_headers[key] = getattr(err, key, None)
                 if not self.fail_silently:
@@ -244,43 +358,50 @@ class SESBackend(BaseEmailBackend):
         if len(new_send_times) > rate_limit * window * self._throttle:
             # Sleep the remainder of the window period.
             delta = now - new_send_times[0]
-            total_seconds = (delta.microseconds + (delta.seconds +
-                                                   delta.days * 24 * 3600) * 10 ** 6) / 10 ** 6
+            total_seconds = (delta.microseconds + (delta.seconds + delta.days * 24 * 3600) * 10**6) / 10**6
             delay = window - total_seconds
             if delay > 0:
                 sleep(delay)
         recent_send_times.append(now)
         # end of throttling
 
-    def _get_send_email_parameters(self, message, source, email_feedack):
-        return (self._get_v2_parameters(message, source, email_feedack)
-                if self._use_ses_v2
-                else self._get_v1_parameters(message, source))
+    def _get_send_email_parameters(self, message, source, email_feedack, tenant_name=None):
+        return (
+            self._get_v2_parameters(message, source, email_feedack, tenant_name)
+            if self._use_ses_v2
+            else self._get_v1_parameters(message, source)
+        )
 
-    def _get_v2_parameters(self, message, source, email_feedback):
+    def _get_v2_parameters(self, message, source, email_feedback, tenant_name=None):
         """V2-Style raw payload for `send_email`.
 
         https://boto3.amazonaws.com/v1/documentation/api/1.26.31/reference/services/sesv2.html#SESV2.Client.send_email
         """
         params = dict(
             FromEmailAddress=source or message.from_email,
-            Destination={
-                'ToAddresses': message.recipients()
-            },
+            Destination={"ToAddresses": message.recipients()},
             Content={
-                'Raw': {
-                    'Data': dkim_sign(message.message().as_bytes(linesep="\r\n"),
-                                      dkim_key=self.dkim_key,
-                                      dkim_domain=self.dkim_domain,
-                                      dkim_selector=self.dkim_selector,
-                                      dkim_headers=self.dkim_headers)
+                "Raw": {
+                    "Data": dkim_sign(
+                        get_message_bytes(message),
+                        dkim_key=self.dkim_key,
+                        dkim_domain=self.dkim_domain,
+                        dkim_selector=self.dkim_selector,
+                        dkim_headers=self.dkim_headers,
+                    )
                 }
-            }
+            },
         )
         if self.ses_from_arn or self.ses_source_arn:
-            params['FromEmailAddressIdentityArn'] = self.ses_from_arn or self.ses_source_arn
+            params["FromEmailAddressIdentityArn"] = self.ses_from_arn or self.ses_source_arn
         if email_feedback is not None:
-            params['FeedbackForwardingEmailAddress'] = email_feedback
+            params["FeedbackForwardingEmailAddress"] = email_feedback
+
+        # Add global endpoint ID if configured
+        if self._global_endpoint_id:
+            params["EndpointId"] = self._global_endpoint_id
+        if tenant_name:
+            params["TenantName"] = tenant_name
 
         return params
 
@@ -292,18 +413,22 @@ class SESBackend(BaseEmailBackend):
         params = dict(
             Source=source or message.from_email,
             Destinations=message.recipients(),
-            RawMessage={'Data': dkim_sign(message.message().as_bytes(linesep="\r\n"),
-                                          dkim_key=self.dkim_key,
-                                          dkim_domain=self.dkim_domain,
-                                          dkim_selector=self.dkim_selector,
-                                          dkim_headers=self.dkim_headers)}
+            RawMessage={
+                "Data": dkim_sign(
+                    get_message_bytes(message),
+                    dkim_key=self.dkim_key,
+                    dkim_domain=self.dkim_domain,
+                    dkim_selector=self.dkim_selector,
+                    dkim_headers=self.dkim_headers,
+                )
+            },
         )
         if self.ses_source_arn:
-            params['SourceArn'] = self.ses_source_arn
+            params["SourceArn"] = self.ses_source_arn
         if self.ses_from_arn:
-            params['FromArn'] = self.ses_from_arn
+            params["FromArn"] = self.ses_from_arn
         if self.ses_return_path_arn:
-            params['ReturnPathArn'] = self.ses_return_path_arn
+            params["ReturnPathArn"] = self.ses_return_path_arn
         return params
 
     def get_rate_limit(self):
@@ -312,8 +437,7 @@ class SESBackend(BaseEmailBackend):
 
         new_conn_created = self.open()
         if not self.connection:
-            raise Exception(
-                "No connection is available to check current SES rate limit.")
+            raise Exception("No connection is available to check current SES rate limit.")
         try:
             return self._get_v2_send_quota() if self._use_ses_v2 else self._get_v1_send_quota()
         finally:
@@ -326,15 +450,15 @@ class SESBackend(BaseEmailBackend):
         https://boto3.amazonaws.com/v1/documentation/api/1.26.31/reference/services/sesv2.html#SESV2.Client.get_account
         """
         account_dict = self.connection.get_account()
-        quota_dict = account_dict['SendQuota']
-        max_per_second = quota_dict['MaxSendRate']
+        quota_dict = account_dict["SendQuota"]
+        max_per_second = quota_dict["MaxSendRate"]
         ret = float(max_per_second)
         cached_rate_limits[self._access_key_id] = ret
         return ret
 
     def _get_v1_send_quota(self):
         quota_dict = self.connection.get_send_quota()
-        max_per_second = quota_dict['MaxSendRate']
+        max_per_second = quota_dict["MaxSendRate"]
         ret = float(max_per_second)
         cached_rate_limits[self._access_key_id] = ret
         return ret

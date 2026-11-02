@@ -1,9 +1,10 @@
 from django.db import NotSupportedError
 from django.dispatch import Signal
 
-from django_ses import settings
+from django_ses.conf import settings
 
 # The following fields are used from the 3 signals below: mail_obj, bounce_obj, raw_message
+message_sent = Signal()
 bounce_received = Signal()
 complaint_received = Signal()
 delivery_received = Signal()
@@ -35,10 +36,10 @@ def _blacklist_recipients(recipients):
     # possibility only when using Oracle because it doesn't support
     # ignore_conflicts), fallback to one-by-one insertion.
     try:
-        models.BlacklistedEmail.objects.bulk_create([
-            models.BlacklistedEmail(email=email) for email in unblacklisted_emails
-        ], ignore_conflicts=True)
-    except NotSupportedError: # Oracle doesn't support "ignore_conflicts"
+        models.BlacklistedEmail.objects.bulk_create(
+            [models.BlacklistedEmail(email=email) for email in unblacklisted_emails], ignore_conflicts=True
+        )
+    except NotSupportedError:  # Oracle doesn't support "ignore_conflicts"
         for email in recipients:
             models.BlacklistedEmail.objects.get_or_create(email=email)
 
@@ -48,6 +49,7 @@ def bounce_handler(sender, mail_obj, bounce_obj, raw_message, *args, **kwargs):
         return
 
     from django_ses.utils import get_permanent_bounced_emails_from_bounce_obj
+
     bounced_recipients = get_permanent_bounced_emails_from_bounce_obj(bounce_obj)
     _blacklist_recipients(bounced_recipients)
 
@@ -57,5 +59,6 @@ def complaint_handler(sender, mail_obj, complaint_obj, raw_message, *args, **kwa
         return
 
     from django_ses.utils import get_emails_from_complaint_obj
+
     complaint_emails = get_emails_from_complaint_obj(complaint_obj)
     _blacklist_recipients(complaint_emails)

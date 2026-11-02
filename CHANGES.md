@@ -23,6 +23,140 @@ Fixes:
 
 ## Current
 
+**4.9.0**
+
+Add support for sending email through an Amazon SES tenant with the
+`AWS_SES_TENANT` setting (string or per-message callable) or an
+`X-SES-TENANT` message header. Requires SES v2 and boto3/botocore 1.40.0+
+(Python 3.9+); `SESBackend` raises `ValueError` if `AWS_SES_TENANT` is set
+with an older botocore.
+
+`send_messages()` now treats boto3 `ClientError` as a send failure when
+`fail_silently` is true. Previously only urllib3 `ResponseError` was
+caught, so `EmailMessage.send(fail_silently=True)` still raised when SES
+rejected the message.
+
+`get_ses_statistics` refreshes a stored daily row when any of the four
+aggregate counters changes. Previously an existing row was updated only
+when delivery attempts changed, so bounces, complaints, and rejects could
+stay stale.
+
+README examples for a custom inbound email parser and the statistics URL
+configuration now use valid imports.
+
+Pulls:
+  - https://github.com/django-ses/django-ses/pull/379
+  - https://github.com/django-ses/django-ses/pull/381
+  - https://github.com/django-ses/django-ses/pull/384
+  - https://github.com/django-ses/django-ses/pull/385
+
+## Past
+
+
+**4.8.2**
+
+Keep the test suite compatible with Python 3.8 and 3.9. Parenthesized
+`with` statements, introduced by formatting for Python 3.14, are a syntax
+error on those versions, so `tests.test_views` failed to import. Ruff's
+target version is now 3.8, matching the oldest Python in the CI matrix.
+
+Pulls:
+  - https://github.com/django-ses/django-ses/pull/380
+
+**4.8.1**
+
+Security: the SES event webhook now rejects notifications and subscription
+confirmations from SNS topics not listed in the new
+`AWS_SNS_EVENT_TRUSTED_TOPIC_ARNS` setting. Previously, signature
+verification alone gated the webhook, which proves a message came from
+some AWS SNS topic but not from the operator's own topic; anyone with an
+AWS account could POST a genuinely AWS-signed notification from their own
+topic and have their content processed, including bounce/complaint events
+used to populate the blacklist. The new setting defaults to an empty list,
+which preserves existing behaviour, so operators should set it to their
+real topic ARN(s). `SubscribeURL` fetches during subscription confirmation
+are also restricted to https SNS service hosts.
+
+**4.8.0**
+
+Add support for Django 6.1, including use as a `MAILERS` backend.
+
+`SESBackend` no longer forwards `fail_silently` to `BaseEmailBackend.__init__()`.
+Django 6.1 removed that argument: forwarding it raised `InvalidMailer` when the
+backend was instantiated from a `MAILERS` alias, and emitted a
+`RemovedInDjango70Warning` otherwise.
+
+Pulls:
+  - https://github.com/django-ses/django-ses/pull/376
+  - https://github.com/django-ses/django-ses/pull/374
+  - https://github.com/django-ses/django-ses/pull/372
+  - https://github.com/django-ses/django-ses/pull/375
+
+**4.7.2**
+
+Handle bounce with bounceType when status is missing
+
+Pulls:
+  - https://github.com/django-ses/django-ses/pull/369
+
+Issues:
+
+  - https://github.com/django-ses/django-ses/pull/368
+
+**4.7.1**
+
+Re-add Django 3.2 support
+
+**4.7.0**
+
+Add Global Endpoint (Multi-Region) support
+
+Pulls:
+  - https://github.com/django-ses/django-ses/pull/367
+
+Issues:
+
+  - N/A
+
+**4.6.0**
+
+Add Django 6 and python 3.13/3.14 support.
+
+Pulls:
+  - https://github.com/django-ses/django-ses/pull/365
+  - https://github.com/django-ses/django-ses/pull/364
+
+Issues:
+
+  - https://github.com/django-ses/django-ses/issues/362
+
+
+## Past
+
+**4.5.0**
+
+Updates how settings are declared to allow @override_settings to work.
+Also adds typing for settings and removes hackiness from tests.
+
+Pulls:
+  - https://github.com/django-ses/django-ses/pull/358
+  - https://github.com/django-ses/django-ses/pull/360
+
+Issues:
+
+  - https://github.com/django-ses/django-ses/issues/359
+
+**4.4.0**
+
+Add a signal for message sent.
+
+Pulls:
+  - https://github.com/django-ses/django-ses/pull/347
+
+Issues:
+
+  - https://github.com/django-ses/django-ses/issues/346
+
 **4.3.2**
 
 Don't require `django-ses` to be in `INSTALLED_APPS` unless using the blacklist feature.
@@ -33,9 +167,6 @@ Pulls:
 Issues:
 
   - https://github.com/django-ses/django-ses/issues/343
-
-
-## Past
 
 **4.3.1**
 

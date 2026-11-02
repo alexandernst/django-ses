@@ -1,13 +1,20 @@
-from django.test import TestCase
+from django.core.mail import send_mail
+from django.test import TestCase, override_settings
 
-from django_ses import models, settings, signals
-from tests.mocks import get_mock_bounce, get_mock_complaint
+from django_ses import models, signals
+from tests.mocks import (
+    get_mock_bounce,
+    get_mock_bounce_no_status,
+    get_mock_bounce_no_status_transient,
+    get_mock_complaint,
+)
 
 
 class SignalsTestCase(TestCase):
     """
     Test the signals handlers.
     """
+
     def test_bounce_handler(self):
         count = models.BlacklistedEmail.objects.all().count()
         self.assertEqual(count, 0)
@@ -21,20 +28,19 @@ class SignalsTestCase(TestCase):
         self.assertEqual(count, 0)
 
         # ... but after enabling the feature...
-        settings.AWS_SES_ADD_BOUNCE_TO_BLACKLIST = True
+        with override_settings(AWS_SES_ADD_BOUNCE_TO_BLACKLIST=True):
+            signals.bounce_handler(None, mail_obj, bounce_obj, notification)
 
         # ... it should insert the email in the blacklist
-        signals.bounce_handler(None, mail_obj, bounce_obj, notification)
         count = models.BlacklistedEmail.objects.all().count()
         self.assertEqual(count, 1)
 
+    @override_settings(AWS_SES_ADD_BOUNCE_TO_BLACKLIST=True)
     def test_bounce_handler_twice(self):
         count = models.BlacklistedEmail.objects.all().count()
         self.assertEqual(count, 0)
 
         mail_obj, bounce_obj, notification = get_mock_bounce("eventType")
-
-        settings.AWS_SES_ADD_BOUNCE_TO_BLACKLIST = True
 
         # ... it should insert the email in the blacklist
         signals.bounce_handler(None, mail_obj, bounce_obj, notification)
@@ -45,6 +51,31 @@ class SignalsTestCase(TestCase):
         signals.bounce_handler(None, mail_obj, bounce_obj, notification)
         count = models.BlacklistedEmail.objects.all().count()
         self.assertEqual(count, 1)
+
+    def test_bounce_handler_no_status(self):
+        count = models.BlacklistedEmail.objects.all().count()
+        self.assertEqual(count, 0)
+
+        mail_obj, bounce_obj, notification = get_mock_bounce_no_status("eventType")
+
+        with override_settings(AWS_SES_ADD_BOUNCE_TO_BLACKLIST=True):
+            signals.bounce_handler(None, mail_obj, bounce_obj, notification)
+
+        count = models.BlacklistedEmail.objects.all().count()
+        self.assertEqual(count, 2)
+
+    def test_bounce_handler_no_status_transient(self):
+        count = models.BlacklistedEmail.objects.all().count()
+        self.assertEqual(count, 0)
+
+        mail_obj, bounce_obj, notification = get_mock_bounce_no_status_transient("eventType")
+
+        with override_settings(AWS_SES_ADD_BOUNCE_TO_BLACKLIST=True):
+            signals.bounce_handler(None, mail_obj, bounce_obj, notification)
+
+        # ... it should not insert the email in the blacklist
+        count = models.BlacklistedEmail.objects.all().count()
+        self.assertEqual(count, 0)
 
     def test_complaint_handler(self):
         count = models.BlacklistedEmail.objects.all().count()
@@ -59,20 +90,19 @@ class SignalsTestCase(TestCase):
         self.assertEqual(count, 0)
 
         # ... but after enabling the feature...
-        settings.AWS_SES_ADD_COMPLAINT_TO_BLACKLIST = True
+        with override_settings(AWS_SES_ADD_COMPLAINT_TO_BLACKLIST=True):
+            signals.complaint_handler(None, mail_obj, complaint_obj, notification)
 
         # ... it should insert the email in the blacklist
-        signals.complaint_handler(None, mail_obj, complaint_obj, notification)
         count = models.BlacklistedEmail.objects.all().count()
         self.assertEqual(count, 1)
 
+    @override_settings(AWS_SES_ADD_COMPLAINT_TO_BLACKLIST=True)
     def test_complaint_handler_twice(self):
         count = models.BlacklistedEmail.objects.all().count()
         self.assertEqual(count, 0)
 
         mail_obj, complaint_obj, notification = get_mock_complaint("eventType")
-
-        settings.AWS_SES_ADD_COMPLAINT_TO_BLACKLIST = True
 
         # ... it should insert the email in the blacklist
         signals.complaint_handler(None, mail_obj, complaint_obj, notification)
@@ -83,3 +113,17 @@ class SignalsTestCase(TestCase):
         signals.complaint_handler(None, mail_obj, complaint_obj, notification)
         count = models.BlacklistedEmail.objects.all().count()
         self.assertEqual(count, 1)
+
+    @override_settings(EMAIL_BACKEND="tests.test_backend.FakeSESBackend")
+    def test_message_sent_handler(self):
+        def _handler(sender, message, **kwargs):
+            _handler.call_count += 1
+            self.assertEqual(message.subject, "subject")
+            self.assertEqual(message.body, "body")
+            self.assertEqual(message.extra_headers["message_id"], "fake_message_id")
+
+        _handler.call_count = 0
+        signals.message_sent.connect(_handler)
+
+        send_mail("subject", "body", "from@example.com", ["to@example.com"])
+        self.assertEqual(_handler.call_count, 1)

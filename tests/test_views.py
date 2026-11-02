@@ -7,10 +7,9 @@ except ImportError:
     import mock
 
 import django
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 
-from django_ses import settings
 from django_ses import utils as ses_utils
 from django_ses.inbound import BaseHandler
 from django_ses.signals import (
@@ -32,10 +31,36 @@ from tests.mocks import (
 )
 
 
+def patch_signal_receiver(signal, mock_func):
+    """
+    Patch a Django signal receiver with a mock function.
+
+    Handles differences in receiver structure across Django versions:
+    - Django <5: (lookup_key, weakref)
+    - Django 5.x: (lookup_key, weakref, is_async)
+    - Django >=6: (lookup_key, weakref, sender_weakref, is_async)
+
+    Args:
+        signal: The Django signal to patch
+        mock_func: The mock function to use as replacement
+    """
+    receiver = signal.receivers[0]
+
+    if django.VERSION[0] < 5:
+        patched_receiver = (receiver[0], weakref.ref(mock_func))
+    elif django.VERSION[0] < 6:
+        patched_receiver = (receiver[0], weakref.ref(mock_func), False)
+    else:
+        patched_receiver = (receiver[0], weakref.ref(mock_func), None, False)
+
+    signal.receivers[0] = patched_receiver
+
+
 class HandleBounceTestCase(TestCase):
     """
     Test the bounce web hook handler.
     """
+
     def setUp(self):
         self._old_bounce_receivers = bounce_received.receivers
         bounce_received.receivers = []
@@ -58,6 +83,7 @@ class HandleBounceTestCase(TestCase):
             self.assertEqual(req_mail_obj, mail_obj)
             self.assertEqual(req_bounce_obj, bounce_obj)
             self.assertEqual(raw_message, json.dumps(notification).encode())
+
         _handler.call_count = 0
         bounce_received.connect(_handler)
 
@@ -65,8 +91,9 @@ class HandleBounceTestCase(TestCase):
         with mock.patch.object(ses_utils, "verify_event_message") as verify:
             verify.return_value = True
 
-            response = self.client.post(reverse("django_ses_bounce"), json.dumps(notification),
-                                        content_type="application/json")
+            response = self.client.post(
+                reverse("django_ses_bounce"), json.dumps(notification), content_type="application/json"
+            )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(_handler.call_count, 1)
 
@@ -81,6 +108,7 @@ class HandleBounceTestCase(TestCase):
             self.assertEqual(req_mail_obj, mail_obj)
             self.assertEqual(req_bounce_obj, bounce_obj)
             self.assertEqual(raw_message, json.dumps(notification).encode())
+
         _handler.call_count = 0
         bounce_received.connect(_handler)
 
@@ -88,23 +116,36 @@ class HandleBounceTestCase(TestCase):
         with mock.patch.object(ses_utils, "verify_event_message") as verify:
             verify.return_value = True
 
-            response = self.client.post(reverse("django_ses_bounce"), json.dumps(notification),
-                                        content_type="application/json")
+            response = self.client.post(
+                reverse("django_ses_bounce"), json.dumps(notification), content_type="application/json"
+            )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(_handler.call_count, 1)
+
+    @override_settings(AWS_SNS_EVENT_TRUSTED_TOPIC_ARNS=["arn:aws:sns:us-east-1:123456789012:SomeOtherTopic"])
+    def test_handle_bounce_rejects_untrusted_topic(self):
+        """The deprecated bounce webhook also enforces the topic allowlist."""
+        _, _, notification = get_mock_bounce("eventType")
+
+        with mock.patch.object(ses_utils, "verify_event_message") as verify:
+            verify.return_value = True
+            response = self.client.post(
+                reverse("django_ses_bounce"), json.dumps(notification), content_type="application/json"
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.content, "Untrusted topic.".encode())
 
 
 # We're using a TransactionTestCase instead of a TestCase because we want to
 # avoid using transactions. Calls to atomic() will disconnect the signal
 # handlers, which is exactly what we're trying to test here.
 class HandleBounceTestCaseWithBL(TransactionTestCase):
+    @override_settings(AWS_SES_VERIFY_BOUNCE_SIGNATURES=False)
     def test_bounce_event_can_perform_blacklist(self):
         """
         Test if bounce events result in blacklisted emails (if the feature has
         been enabled)
         """
-
-        settings.VERIFY_BOUNCE_SIGNATURES = False
 
         mail_obj, bounce_obj, notification = get_mock_bounce("eventType")
 
@@ -114,33 +155,19 @@ class HandleBounceTestCaseWithBL(TransactionTestCase):
         # The only way is to patch the actual .receivers prop at "this" exact
         # moment.
         mock_func = mock.MagicMock()
-        receiver = bounce_received.receivers[0]
-
-        # Django<5 had only synchronous receivers, but >=5 can have asynchronous
-        # ones as well. This caused the receivers structure to change:
-        #
-        # 4.2.16: https://github.com/django/django/blob/4.2.16/django/dispatch/dispatcher.py#L253
-        # 5.0: https://github.com/django/django/blob/5.0/django/dispatch/dispatcher.py#L431
-        #
-        # We must account for that difference and prepare a tuple that will
-        # match the expected signature.
-        if django.VERSION[0] < 5:
-            receiver = (receiver[0], weakref.ref(mock_func))
-        else:
-            receiver = (receiver[0], weakref.ref(mock_func), False)
-        bounce_received.receivers[0] = receiver
-        response = self.client.post(reverse("django_ses_bounce"), json.dumps(notification),
-                                    content_type="application/json")
+        patch_signal_receiver(bounce_received, mock_func)
+        response = self.client.post(
+            reverse("django_ses_bounce"), json.dumps(notification), content_type="application/json"
+        )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(mock_func.call_count, 1)
 
+    @override_settings(AWS_SES_VERIFY_BOUNCE_SIGNATURES=False)
     def test_complaint_event_can_perform_blacklist(self):
         """
         Test if complaint events result in blacklisted emails (if the feature
         has been enabled)
         """
-
-        settings.VERIFY_BOUNCE_SIGNATURES = False
 
         mail_obj, complaint_obj, notification = get_mock_complaint("eventType")
 
@@ -150,24 +177,11 @@ class HandleBounceTestCaseWithBL(TransactionTestCase):
         # The only way is to patch the actual .receivers prop at "this" exact
         # moment.
         mock_func = mock.MagicMock()
-        receiver = complaint_received.receivers[0]
+        patch_signal_receiver(complaint_received, mock_func)
 
-        # Django<5 had only synchronous receivers, but >=5 can have asynchronous
-        # ones as well. This caused the receivers structure to change:
-        #
-        # 4.2.16: https://github.com/django/django/blob/4.2.16/django/dispatch/dispatcher.py#L253
-        # 5.0: https://github.com/django/django/blob/5.0/django/dispatch/dispatcher.py#L431
-        #
-        # We must account for that difference and prepare a tuple that will
-        # match the expected signature.
-        if django.VERSION[0] < 5:
-            receiver = (receiver[0], weakref.ref(mock_func))
-        else:
-            receiver = (receiver[0], weakref.ref(mock_func), False)
-
-        complaint_received.receivers[0] = receiver
-        response = self.client.post(reverse("django_ses_bounce"), json.dumps(notification),
-                                    content_type="application/json")
+        response = self.client.post(
+            reverse("django_ses_bounce"), json.dumps(notification), content_type="application/json"
+        )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(mock_func.call_count, 1)
 
@@ -176,6 +190,7 @@ class HandleEventTestCase(TestCase):
     """
     Test the event web hook handler.
     """
+
     def setUp(self):
         self._old_bounce_receivers = bounce_received.receivers
         bounce_received.receivers = []
@@ -198,17 +213,18 @@ class HandleEventTestCase(TestCase):
             self.assertEqual(req_mail_obj, mail_obj)
             self.assertEqual(req_bounce_obj, bounce_obj)
             self.assertEqual(raw_message, json.dumps(notification).encode())
+
         _handler.call_count = 0
         bounce_received.connect(_handler)
 
         # Mock the verification
         with mock.patch.object(ses_utils, "verify_event_message") as verify:
             verify.return_value = True
-            response = self.client.post(reverse("event_webhook"), json.dumps(notification),
-                                        content_type="application/json")
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(_handler.call_count, 1)
-
 
     def test_handle_bounce_notification(self):
         """
@@ -221,17 +237,18 @@ class HandleEventTestCase(TestCase):
             self.assertEqual(req_mail_obj, mail_obj)
             self.assertEqual(req_bounce_obj, bounce_obj)
             self.assertEqual(raw_message, json.dumps(notification).encode())
+
         _handler.call_count = 0
         bounce_received.connect(_handler)
 
         # Mock the verification
         with mock.patch.object(ses_utils, "verify_event_message") as verify:
             verify.return_value = True
-            response = self.client.post(reverse("event_webhook"), json.dumps(notification),
-                                        content_type="application/json")
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(_handler.call_count, 1)
-
 
     def test_handle_send_event(self):
         """
@@ -244,14 +261,16 @@ class HandleEventTestCase(TestCase):
             self.assertEqual(req_mail_obj, mail_obj)
             self.assertEqual(req_send_obj, send_obj)
             self.assertEqual(raw_message, json.dumps(notification).encode())
+
         _handler.call_count = 0
         send_received.connect(_handler)
 
         # Mock the verification
         with mock.patch.object(ses_utils, "verify_event_message") as verify:
             verify.return_value = True
-            response = self.client.post(reverse("event_webhook"), json.dumps(notification),
-                                        content_type="application/json")
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(_handler.call_count, 1)
 
@@ -266,14 +285,16 @@ class HandleEventTestCase(TestCase):
             self.assertEqual(req_mail_obj, mail_obj)
             self.assertEqual(req_delivery_obj, delivery_obj)
             self.assertEqual(raw_message, json.dumps(notification).encode())
+
         _handler.call_count = 0
         delivery_received.connect(_handler)
 
         # Mock the verification
         with mock.patch.object(ses_utils, "verify_event_message") as verify:
             verify.return_value = True
-            response = self.client.post(reverse("event_webhook"), json.dumps(notification),
-                                        content_type="application/json")
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(_handler.call_count, 1)
 
@@ -288,14 +309,16 @@ class HandleEventTestCase(TestCase):
             self.assertEqual(req_mail_obj, mail_obj)
             self.assertEqual(req_open_obj, open_obj)
             self.assertEqual(raw_message, json.dumps(notification).encode())
+
         _handler.call_count = 0
         open_received.connect(_handler)
 
         # Mock the verification
         with mock.patch.object(ses_utils, "verify_event_message") as verify:
             verify.return_value = True
-            response = self.client.post(reverse("event_webhook"), json.dumps(notification),
-                                        content_type="application/json")
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(_handler.call_count, 1)
 
@@ -310,22 +333,24 @@ class HandleEventTestCase(TestCase):
             self.assertEqual(req_mail_obj, mail_obj)
             self.assertEqual(req_click_obj, click_obj)
             self.assertEqual(raw_message, json.dumps(notification).encode())
+
         _handler.call_count = 0
         click_received.connect(_handler)
 
         # Mock the verification
         with mock.patch.object(ses_utils, "verify_event_message") as verify:
             verify.return_value = True
-            response = self.client.post(reverse("event_webhook"), json.dumps(notification),
-                                        content_type="application/json")
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(_handler.call_count, 1)
 
+    @override_settings(AWS_SES_INBOUND_HANDLER="global.DummyClass")
     def test_handle_received_event(self):
         """
         Test handling a received event request.
         """
-        settings.AWS_SES_INBOUND_HANDLER = "global.DummyClass"
 
         req_mail_obj, req_content, req_receipt_obj, notification = get_mock_received_sns()
 
@@ -340,12 +365,12 @@ class HandleEventTestCase(TestCase):
             mock_import_module.return_value = mock.MagicMock(DummyClass=DummyClass)
 
             with mock.patch.object(DummyClass, "handle") as mock_handle:
-
                 # Mock the verification
                 with mock.patch.object(ses_utils, "verify_event_message") as verify:
                     verify.return_value = True
-                    response = self.client.post(reverse("event_webhook"), json.dumps(notification),
-                                                content_type="application/json")
+                    response = self.client.post(
+                        reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+                    )
                 self.assertEqual(response.status_code, 200)
 
                 mock_handle.assert_called_once()
@@ -367,7 +392,130 @@ class HandleEventTestCase(TestCase):
         # Mock the verification
         with mock.patch.object(ses_utils, "verify_event_message") as verify:
             verify.return_value = False
-            response = self.client.post(reverse("event_webhook"), json.dumps(notification),
-                                        content_type="application/json")
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.content, "Signature verification failed.".encode())
+
+    @override_settings(AWS_SNS_EVENT_TRUSTED_TOPIC_ARNS=["arn:aws:sns:us-east-1:123456789012:MyTopic"])
+    def test_trusted_topic_is_processed(self):
+        """
+        A notification from an allowlisted topic is processed as before.
+        """
+        _, _, notification = get_mock_click()
+
+        with mock.patch.object(ses_utils, "verify_event_message") as verify:
+            verify.return_value = True
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
+        self.assertEqual(response.status_code, 200)
+
+    @override_settings(AWS_SNS_EVENT_TRUSTED_TOPIC_ARNS=["arn:aws:sns:us-east-1:123456789012:SomeOtherTopic"])
+    def test_untrusted_topic_is_rejected(self):
+        """
+        A validly signed notification from a topic that isn't allowlisted must
+        still be rejected: a valid signature only proves AWS sent it, not that
+        it came from a topic this application owns or subscribed to.
+        """
+        _, _, notification = get_mock_click()
+
+        with mock.patch.object(ses_utils, "verify_event_message") as verify:
+            verify.return_value = True
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.content, "Untrusted topic.".encode())
+
+    def test_no_allowlist_preserves_existing_behaviour(self):
+        """
+        With AWS_SNS_EVENT_TRUSTED_TOPIC_ARNS unset (the default), any topic
+        is still accepted, matching behaviour prior to this check existing.
+        """
+        _, _, notification = get_mock_click()
+
+        with mock.patch.object(ses_utils, "verify_event_message") as verify:
+            verify.return_value = True
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
+        self.assertEqual(response.status_code, 200)
+
+    @override_settings(AWS_SNS_EVENT_TRUSTED_TOPIC_ARNS=["arn:aws:sns:us-east-1:123456789012:MyTopic"])
+    def test_untrusted_subscription_confirmation_is_not_confirmed(self):
+        """
+        A SubscriptionConfirmation for an untrusted topic must be rejected
+        before django-ses ever fetches the SubscribeURL, since visiting that
+        URL is what actually attaches the attacker's topic to this endpoint.
+        """
+        notification = {
+            "Type": "SubscriptionConfirmation",
+            "MessageId": "165545c9-2a5c-472c-8df2-7ff2be2b3b1b",
+            "TopicArn": "arn:aws:sns:us-east-1:123456789012:AttackerTopic",
+            "SubscribeURL": "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&...",
+            "Timestamp": "2012-05-02T00:54:06.655Z",
+            "SignatureVersion": "1",
+            "Signature": "",
+            "SigningCertURL": "",
+        }
+
+        with mock.patch.object(ses_utils, "verify_event_message") as verify, mock.patch(
+            "django_ses.utils.urlopen"
+        ) as urlopen:
+            verify.return_value = True
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
+        self.assertEqual(response.status_code, 400)
+        urlopen.assert_not_called()
+
+    @override_settings(AWS_SNS_EVENT_TRUSTED_TOPIC_ARNS=["arn:aws:sns:us-east-1:123456789012:MyTopic"])
+    def test_trusted_subscription_confirmation_is_confirmed(self):
+        """A SubscriptionConfirmation for an allowlisted topic still confirms."""
+        notification = {
+            "Type": "SubscriptionConfirmation",
+            "MessageId": "165545c9-2a5c-472c-8df2-7ff2be2b3b1b",
+            "TopicArn": "arn:aws:sns:us-east-1:123456789012:MyTopic",
+            "SubscribeURL": "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&Token=abc",
+            "Timestamp": "2012-05-02T00:54:06.655Z",
+            "SignatureVersion": "1",
+            "Signature": "",
+            "SigningCertURL": "",
+        }
+
+        with mock.patch.object(ses_utils, "verify_event_message") as verify, mock.patch(
+            "django_ses.utils.urlopen"
+        ) as urlopen:
+            verify.return_value = True
+            urlopen.return_value.read.return_value = b"ok"
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
+        self.assertEqual(response.status_code, 200)
+        urlopen.assert_called_once()
+
+    @override_settings(AWS_SNS_EVENT_TRUSTED_TOPIC_ARNS=["arn:aws:sns:us-east-1:123456789012:MyTopic"])
+    def test_untrusted_subscribe_url_is_not_fetched(self):
+        """SubscribeURL must be an https SNS host even for a trusted topic."""
+        notification = {
+            "Type": "SubscriptionConfirmation",
+            "MessageId": "165545c9-2a5c-472c-8df2-7ff2be2b3b1b",
+            "TopicArn": "arn:aws:sns:us-east-1:123456789012:MyTopic",
+            "SubscribeURL": "file:///etc/passwd",
+            "Timestamp": "2012-05-02T00:54:06.655Z",
+            "SignatureVersion": "1",
+            "Signature": "",
+            "SigningCertURL": "",
+        }
+
+        with mock.patch.object(ses_utils, "verify_event_message") as verify, mock.patch(
+            "django_ses.utils.urlopen"
+        ) as urlopen:
+            verify.return_value = True
+            response = self.client.post(
+                reverse("event_webhook"), json.dumps(notification), content_type="application/json"
+            )
+        self.assertEqual(response.status_code, 200)
+        urlopen.assert_not_called()

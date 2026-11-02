@@ -56,17 +56,17 @@ time-consuming. Sending emails with Django-SES might be attractive to you if:
   whitelist/blacklist services.
 * You want to improve delivery rate and inbox cosmetics by DKIM signing
   your messages using SES's Easy DKIM feature.
-* Django-SES is a truely drop-in replacement for the default mail backend.
+* Django-SES is a truly drop-in replacement for the default mail backend.
   Your code should require no changes.
 
 Why SES instead of IMAP/POP?
 ============================
 
 Configuring, maintaining, and dealing with some complicated edge cases can be
-time-consuming. REceiving emails with Django-SES might be attractive to you if:
+time-consuming. Receiving emails with Django-SES might be attractive to you if:
 
 * You don't want to maintain mail servers.
-* You want programatic access to received emails.
+* You want programmatic access to received emails.
 * You want to react to received emails as soon as they are received.
 
 Getting going
@@ -97,6 +97,10 @@ Add the following to your settings.py::
     # If you want to use the SESv2 client
     USE_SES_V2 = True
 
+    # If you want to use SES Global Endpoint (Multi-Region Endpoint) for high availability
+    AWS_SES_GLOBAL_ENDPOINT_ID = 'abcdef12.g3h'  # Your global endpoint ID
+    USE_SES_V2 = True  # Required for global endpoints
+
 Alternatively, instead of `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, you
 can include the following two settings values. This is useful in situations
 where you would like to use a separate access key to send emails via SES than
@@ -107,6 +111,29 @@ you would to upload files via S3::
 
 Now, when you use ``django.core.mail.send_mail``, Simple Email Service will
 send the messages by default.
+
+On Django 6.1+ you can instead use the ``MAILERS`` setting, which replaces
+``EMAIL_BACKEND`` in Django 7.0::
+
+    MAILERS = {
+        "default": {"BACKEND": "django_ses.SESBackend"},
+    }
+
+The ``AWS_*`` settings above are still read, so nothing else needs to change.
+Any ``SESBackend`` constructor argument may also be given per-mailer under
+``OPTIONS``::
+
+    MAILERS = {
+        "default": {
+            "BACKEND": "django_ses.SESBackend",
+            "OPTIONS": {"aws_region_name": "us-west-2"},
+        },
+    }
+
+Note that ``OPTIONS`` values are passed to ``SESBackend`` verbatim. In
+particular, ``aws_region_endpoint`` must include the scheme
+(``https://email.us-west-2.amazonaws.com``), whereas the
+``AWS_SES_REGION_ENDPOINT`` setting does not.
 
 Since SES imposes a rate limit and will reject emails after the limit has been
 reached, django-ses will attempt to conform to the rate limit by querying the
@@ -126,7 +153,7 @@ To set this up, install `django-ses` with the `events` extra::
 
     pip install django-ses[events]
 
-Then add a event url handler in your `urls.py`::
+Then add a event URL handler in your `urls.py`::
 
     from django.urls import re_path
     from django_ses.views import SESEventWebhookView
@@ -139,6 +166,11 @@ Then add a event url handler in your `urls.py`::
 SESEventWebhookView handles bounce, complaint, send, delivery, open and click events.
 It is also capable of auto confirming subscriptions, it handles `SubscriptionConfirmation` notification.
 
+Set ``AWS_SNS_EVENT_TRUSTED_TOPIC_ARNS`` to the SNS topic ARN(s) you actually
+publish SES events to. A valid SNS signature only proves a message came from
+*an* AWS topic, not from *your* topic. Without this setting, anyone with an
+AWS account can POST a signed notification from their own topic to your webhook.
+
 On AWS
 -------
 1. Add an SNS topic.
@@ -147,7 +179,7 @@ On AWS
 configuration set by setting ``AWS_SES_CONFIGURATION_SET``. Set the topic
 to what you created in 1.
 
-3. Add an https subscriber to the topic. (eg. https://www.yourdomain.com/ses/event-webhook/)
+3. Add an https subscriber to the topic. (e.g., https://www.yourdomain.com/ses/event-webhook/)
 Do not check "Enable raw message delivery".
 
 
@@ -170,7 +202,7 @@ Using signal 'bounce_received' for manager bounce email. For example::
 
 The most common use case for irrecoverable bounces (status ``5xx``) is to add the
 email(s) that caused the bounce to a blacklist in order to avoid sending more
-emails and triggering more bounces. ``django-ses`` provides a builtin blacklist
+emails and triggering more bounces. ``django-ses`` provides a built-in blacklist
 that does this. Check ``AWS_SES_ADD_BOUNCE_TO_BLACKLIST`` and ``AWS_SES_USE_BLACKLIST``.
 
 Complaint
@@ -187,8 +219,25 @@ Using signal 'complaint_received' for manager complaint email. For example::
 
 The most common use case for complaints is to add the email(s) that caused the
 complaint to a blacklist in order to avoid sending more emails and triggering
-more complaints. ``django-ses`` provides a builtin blacklist that does this.
+more complaints. ``django-ses`` provides a built-in blacklist that does this.
 Check ``AWS_SES_ADD_COMPLAINT_TO_BLACKLIST`` and ``AWS_SES_USE_BLACKLIST``.
+
+Message sent
+------------
+
+Use this event to know when an email was sent. Keep in mind that the
+``extra_headers`` field of the message will contain the ``message_id`` that AWS
+SES assigned to the email, which means you could use this event to store emails
+and cross-reference them later if/when you receive a bounce/complaint. For
+example::
+
+    from django_ses.signals import message_sent
+    from django.dispatch import receiver
+
+
+    @receiver(message_sent)
+    def sent_handler(sender, message,  *args, **kwargs):
+        ...
 
 Send
 ----
@@ -283,6 +332,144 @@ where
   be DKIM signed (see DKIM, below for explanation)
 
 .. _SES Event Publishing: https://docs.aws.amazon.com/ses/latest/DeveloperGuide/monitor-using-event-publishing.html
+
+
+SES Tenant Management
+=====================
+
+Amazon SES tenants isolate sending resources and reputation for different
+customers or business units. To send through a tenant, enable SES API v2 and
+set ``AWS_SES_TENANT`` to the tenant name::
+
+    USE_SES_V2 = True
+    AWS_SES_TENANT = 'my-tenant-name'
+
+The verified identity and Configuration Set used for the message must be
+associated with the tenant in Amazon SES.
+
+Tenant sending requires boto3 and botocore 1.40.0 or newer, which in turn
+require Python 3.9 or newer; it is not available on Python 3.8. When
+``AWS_SES_TENANT`` is set, ``SESBackend`` raises ``ValueError`` on creation if
+botocore is older than 1.40.0. Installs that do not set ``AWS_SES_TENANT`` are
+unaffected.
+
+To select a tenant per message, set ``AWS_SES_TENANT`` to a callable. The
+callable receives the same arguments as the
+``AWS_SES_CONFIGURATION_SET`` callable::
+
+    def ses_tenant(message, dkim_domain=None, dkim_key=None,
+                   dkim_selector=None, dkim_headers=()):
+        tenant = 'my-default-tenant'
+        # use message and dkim_* to select the tenant
+        return tenant
+
+    AWS_SES_TENANT = ses_tenant
+
+If the callable returns ``None`` or an empty string, the message is sent
+without a tenant.
+
+To choose the tenant for a single message, set the ``X-SES-TENANT`` header on
+it, the same way you would set ``X-SES-CONFIGURATION-SET``::
+
+    EmailMessage(..., headers={'X-SES-TENANT': 'my-tenant-name'}).send()
+
+The header takes precedence over ``AWS_SES_TENANT`` (a callable is not called
+for that message) and stays in the raw message. With ``USE_SES_V2 = True`` and
+botocore 1.40.0 or newer, its value is also sent as ``TenantName``; otherwise
+only the header is submitted.
+
+Tenant selection from the setting uses the SES v2 ``TenantName`` API parameter.
+Configuring ``AWS_SES_TENANT`` without ``USE_SES_V2 = True`` raises
+``ValueError``.
+
+For more information, see the `AWS SES tenant management documentation`_.
+
+.. _AWS SES tenant management documentation: https://docs.aws.amazon.com/ses/latest/dg/tenants.html
+
+
+SES Global Endpoint (Multi-Region Endpoint)
+============================================
+
+AWS SES Global Endpoints (also known as Multi-Region Endpoints or MREPs) offer
+multi-region high availability and automatic failover. When you use a global
+endpoint, AWS automatically distributes your email sending traffic between two
+AWS regions and handles failover if one region experiences issues.
+
+Benefits
+--------
+
+* **High Availability**: Automatic failover between two AWS regions
+* **Improved Resilience**: Reduced impact from regional outages
+* **Traffic Distribution**: Automatic load balancing between primary and secondary regions
+
+Prerequisites
+-------------
+
+To use global endpoints, you must:
+
+1. **Use SES API v2**: Set ``USE_SES_V2 = True`` (global endpoints require v2)
+2. **Create a Multi-Region Endpoint**: Create via AWS Console or CLI
+3. **Configure both regions**: Verify identities and configure settings in both primary and secondary regions
+4. **Obtain the Endpoint ID**: Get the endpoint ID (e.g., ``abcdef12.g3h``) from the AWS Console or CLI
+
+Creating a Global Endpoint
+---------------------------
+
+**Via AWS Console:**
+
+1. Navigate to SES Console → **Global Endpoints**
+2. Click **Create global endpoint**
+3. Enter a name and select secondary region
+4. Click **Create global endpoint**
+5. Copy the **Endpoint ID** from the details page
+
+**Via AWS CLI:**
+
+.. code-block:: bash
+
+    aws sesv2 create-multi-region-endpoint \
+      --primary-region us-west-2 \
+      --secondary-region us-east-1 \
+      --endpoint-name MyGlobalEndpoint
+
+    # Get the endpoint ID
+    aws sesv2 get-multi-region-endpoint \
+      --endpoint-name MyGlobalEndpoint \
+      --region us-west-2
+
+Usage
+-----
+
+To enable the SES global endpoint in django-ses, add these settings::
+
+    USE_SES_V2 = True  # Required
+    AWS_SES_GLOBAL_ENDPOINT_ID = 'abcdef12.g3h'  # Your endpoint ID
+
+When ``AWS_SES_GLOBAL_ENDPOINT_ID`` is set, django-ses will include the
+``EndpointId`` parameter in all ``send_email`` API calls.
+
+Recommendations
+---------------
+
+AWS recommends using global endpoints with Configuration Sets for better
+tracking and management::
+
+    USE_SES_V2 = True
+    AWS_SES_GLOBAL_ENDPOINT_ID = 'abcdef12.g3h'
+    AWS_SES_CONFIGURATION_SET = 'my-configuration-set'
+
+**Important:** Ensure that configuration sets, verified identities, and
+sending limits are configured in both primary and secondary regions.
+
+Monitoring
+----------
+
+Monitor your global endpoint metrics in the AWS Console under
+**Global Endpoints → [Your Endpoint] → Cross-region metrics**.
+
+For more information, see the `AWS SES documentation on global endpoints`_.
+
+.. _AWS SES documentation on global endpoints: https://docs.aws.amazon.com/ses/latest/dg/global-endpoints.html
 
 
 DKIM
@@ -394,7 +581,9 @@ To generate and view SES sending statistics reports, include, update
 
 ... and ``urls.py``::
 
-    urlpatterns += (url(r'^admin/django-ses/', include('django_ses.urls')),)
+    from django.urls import include, path
+
+    urlpatterns += [path('admin/django-ses/', include('django_ses.urls'))]
 
 *Optional enhancements to stats:*
 
@@ -479,10 +668,10 @@ To manage the blacklist (add, remote, list), run:
 
     python manage.py blacklist
 
-Django Builtin-in Error Emails
+Django Built-in Error Emails
 ==============================
 
-If you'd like Django's `Builtin Email Error Reporting`_ to function properly
+If you'd like Django's `Built-in Email Error Reporting`_ to function properly
 (actually send working emails), you'll have to explicitly set the
 ``SERVER_EMAIL`` setting to one of your SES-verified addresses. Otherwise, your
 error emails will all fail and you'll be blissfully unaware of a problem.
@@ -492,7 +681,7 @@ to use in the `from_email` argument to `django.core.mail.send_email()`. Boto_
 has a `verify_email_address()` method: https://github.com/boto/boto/blob/master/boto/ses/connection.py
 
 .. _Boto: http://boto.cloudhackers.com/
-.. _Builtin Email Error Reporting: https://docs.djangoproject.com/en/dev/howto/error-reporting/
+.. _Built-in Email Error Reporting: https://docs.djangoproject.com/en/dev/howto/error-reporting/
 
 
 Receiving emails
@@ -522,7 +711,7 @@ including headers.
 Depending which method you selected in step 4 you should inherit either from the
 ``SnsHandler`` or the ``S3Handler`` class and create your own handler.
 You should then set the path of your handler in the ``AWS_SES_INBOUND_HANDLER``
-setting (eg. ``AWS_SES_INBOUND_HANDLER='my_app.service.MyReceiver'``).
+setting (e.g., ``AWS_SES_INBOUND_HANDLER='my_app.service.MyReceiver'``).
 
 Example
 
@@ -543,7 +732,7 @@ package, you can reimplement the ``parse_email`` method:
 .. code-block:: python
 
    import mailparser
-   from django_ses.inbound import
+   from django_ses.inbound import SnsHandler
 
    class MyReceiver(SnsHandler):
        def parse_email(self, content):
@@ -589,6 +778,13 @@ Full List of Settings
   Some settings will need this flag enabled.
   See https://boto3.amazonaws.com/v1/documentation/api/1.26.31/reference/services/sesv2.html#id87
 
+``AWS_SES_GLOBAL_ENDPOINT_ID``
+  Optional. The ID of your AWS SES Global Endpoint (Multi-Region Endpoint).
+  Example: ``'abcdef12.g3h'``. When set, django-ses will include the
+  ``EndpointId`` parameter in SES API calls for multi-region high availability
+  and automatic failover. **Requires USE_SES_V2=True** (SES API v2 only).
+  Default is ``None``. See the Global Endpoints section for setup instructions.
+
 ``AWS_SES_FROM_EMAIL``
   Optional. The email address to be used as the "From" address for the email. The address that you specify has to be verified.
   For more information please refer to https://boto3.amazonaws.com/v1/documentation/api/1.26.31/reference/services/sesv2.html#SESV2.Client.send_email
@@ -603,6 +799,13 @@ Full List of Settings
   Configuration Set. Set this to a string if you want all messages to have the
   same configuration set.  Set this to a callable if you want to set
   configuration set on a per message basis.
+
+``AWS_SES_TENANT``
+  Optional. The name of the Amazon SES tenant through which to send. Set this
+  to a string to use one tenant for all messages, or a callable to select a
+  tenant per message (return ``None`` to skip the tenant). A message's
+  ``X-SES-TENANT`` header overrides it. Requires ``USE_SES_V2 = True`` and
+  boto3/botocore 1.40.0 or newer (Python 3.9+). Default is ``None``.
 
 ``TIME_ZONE``
   Default Django setting, optionally set this. Details:
@@ -634,6 +837,16 @@ Full List of Settings
 ``EVENT_CERT_DOMAINS``, ``BOUNCE_CERT_DOMAINS``
   Optional. Default is 'amazonaws.com' and 'amazon.com'.
 
+``AWS_SNS_EVENT_TRUSTED_TOPIC_ARNS``
+  Optional, but strongly recommended. Default is an empty list, which accepts
+  notifications and subscription confirmations from any SNS topic. A valid
+  SNS signature only proves a message came from *an* AWS SNS topic, not that
+  it came from *your* topic -- anyone with an AWS account can create their
+  own topic, have AWS sign a notification, and POST that message to your
+  webhook. Set this to a list of the topic ARN(s) you actually publish SES
+  events to (e.g. ``["arn:aws:sns:us-east-1:123456789012:ses-events"]``) to
+  reject anything else.
+
 ``AWS_SES_ADD_BOUNCE_TO_BLACKLIST``
   If set to ``True`` (default ``False``) email addresses that triggered an
   irrecoverable bounce (status in the ``5xx`` range) will be added to the
@@ -660,7 +873,7 @@ Full List of Settings
 
 ``AWS_SES_INBOUND_HANDLER``
   If you want to receive emails with Django-SES, set this to the path where your
-  handler is (eg ``my_app.service.MyReceiver``).
+  handler is (e.g., ``my_app.service.MyReceiver``).
 
 .. _pydkim: http://hewgill.com/pydkim/
 
@@ -712,15 +925,15 @@ Git hooks (via pre-commit)
 We use pre-push hooks to ensure that only linted code reaches our remote repository and pipelines aren't triggered in
 vain.
 
-To enable the configured pre-push hooks, you need to [install](https://pre-commit.com/) pre-commit and run once::
+To enable the configured pre-push hooks, you need to `install <https://pre-commit.com/>`_ pre-commit and run once::
 
     pre-commit install -t pre-push -t pre-commit --install-hooks
 
 This will permanently install the git hooks for both, frontend and backend, in your local
-[`.git/hooks`](./.git/hooks) folder.
-The hooks are configured in the [`.pre-commit-config.yaml`](.pre-commit-config.yaml).
+``.git/hooks`` folder.
+The hooks are configured in the ``.pre-commit-config.yaml``.
 
-You can check whether hooks work as intended using the [run](https://pre-commit.com/#pre-commit-run) command::
+You can check whether hooks work as intended using the `run <https://pre-commit.com/#pre-commit-run>`_ command::
 
     pre-commit run [hook-id] [options]
 
@@ -756,8 +969,7 @@ To create a release:
     :target: https://pypi.org/project/django-ses/
 .. |build| image:: https://github.com/django-ses/django-ses/actions/workflows/ci.yml/badge.svg
     :target: https://github.com/django-ses/django-ses/actions/workflows/ci.yml
-.. |python| image:: https://img.shields.io/badge/python-3.8|3.9|3.10|3.11|3.12-blue.svg
+.. |python| image:: https://img.shields.io/badge/python-3.8|3.9|3.10|3.11|3.12|3.13|3.14-blue.svg
     :target: https://pypi.org/project/django-ses/
-.. |django| image:: https://img.shields.io/badge/django-4.2%7C%205.0+-blue.svg
+.. |django| image:: https://img.shields.io/badge/django-3.2%20%7C%204.2%20%7C%205.2%20%7C%206.0%20%7C%206.1-blue.svg
     :target: https://www.djangoproject.com/
-
